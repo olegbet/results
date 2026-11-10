@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tektoncd/results/test/performance/metrics"
@@ -45,6 +46,7 @@ func runIndexed(ctx context.Context, concurrency, start, count int, fn indexFunc
 		sets[i] = metrics.NewMetricSet()
 	}
 
+	stateFrom(ctx).beforeMeasurement(ctx)
 	total.Start()
 	var wg sync.WaitGroup
 	for w := 0; w < concurrency; w++ {
@@ -56,16 +58,20 @@ func runIndexed(ctx context.Context, concurrency, start, count int, fn indexFunc
 				if ctx.Err() != nil {
 					return
 				}
-				fn(ctx, i, m)
+				opCtx := stateFrom(ctx).begin(ctx, i)
+				fn(opCtx, i, m)
+				endLogical(opCtx)
 			}
 		}(w)
 	}
 	wg.Wait()
+	stateFrom(ctx).finish(ctx, "count-limit-reached")
 	total.Stop()
 
 	for _, s := range sets {
 		total.Merge(s)
 	}
+	stateFrom(ctx).afterMeasurement(ctx)
 	return total
 }
 
@@ -76,6 +82,13 @@ func runTimed(ctx context.Context, concurrency int, duration time.Duration, fn t
 		concurrency = 1
 	}
 
+	total := metrics.NewMetricSet()
+	sets := make([]*metrics.MetricSet, concurrency)
+	for i := range sets {
+		sets[i] = metrics.NewMetricSet()
+	}
+
+	stateFrom(ctx).beforeMeasurement(ctx)
 	runCtx := ctx
 	if duration > 0 {
 		var cancel context.CancelFunc
@@ -83,13 +96,8 @@ func runTimed(ctx context.Context, concurrency int, duration time.Duration, fn t
 		defer cancel()
 	}
 
-	total := metrics.NewMetricSet()
-	sets := make([]*metrics.MetricSet, concurrency)
-	for i := range sets {
-		sets[i] = metrics.NewMetricSet()
-	}
-
 	total.Start()
+	var dispatch atomic.Int64
 	var wg sync.WaitGroup
 	for w := 0; w < concurrency; w++ {
 		wg.Add(1)
@@ -97,24 +105,33 @@ func runTimed(ctx context.Context, concurrency int, duration time.Duration, fn t
 			defer wg.Done()
 			m := sets[w]
 			for iter := 0; runCtx.Err() == nil; iter++ {
-				fn(runCtx, w, iter, m)
+				index := iter
+				if stateFrom(ctx).sharedDispatch() {
+					index = int(dispatch.Add(1) - 1)
+				}
+				opCtx := stateFrom(ctx).begin(runCtx, index)
+				fn(opCtx, w, index, m)
+				endLogical(opCtx)
 			}
 		}(w)
 	}
 	wg.Wait()
+	stateFrom(ctx).finish(ctx, "duration-limit-reached")
 	total.Stop()
 
 	for _, s := range sets {
 		total.Merge(s)
 	}
+	stateFrom(ctx).afterMeasurement(ctx)
 	return total
 }
 
 // observe times fn, records the latency and result under op, and returns the
 // error so callers can chain (e.g. etag updates).
-func observe(m *metrics.MetricSet, op string, fn func() error) error {
+func observe(ctx context.Context, m *metrics.MetricSet, op string, fn func() error) error {
 	start := time.Now()
 	err := fn()
 	m.Observe(op, time.Since(start), err)
+	recordClient(ctx, op, err, true)
 	return err
 }

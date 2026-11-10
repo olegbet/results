@@ -28,9 +28,10 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -39,6 +40,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
 	"github.com/tektoncd/results/test/performance/generator"
@@ -66,7 +68,7 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.AddCommand(newLoadCmd(), newStoreCmd(), newQueryCmd(), newMixedCmd(), newDatasetCmd())
+	root.AddCommand(newLoadCmd(), newStoreCmd(), newQueryCmd(), newMixedCmd(), newDatasetCmd(), newUsersCmd())
 	return root
 }
 
@@ -76,7 +78,8 @@ func newStoreCmd() *cobra.Command {
 		Use:   "store",
 		Short: "Benchmark write/ingest by replaying the watcher lifecycle over gRPC",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx := cmd.Context()
+			ctx := cfg.runContext(cmd.Context())
+			defer cfg.runtime.close()
 			clients, err := NewAPIClients(cfg.clientConfig())
 			if err != nil {
 				return err
@@ -90,19 +93,16 @@ func newStoreCmd() *cobra.Command {
 			m := runIndexed(ctx, cfg.Concurrency, 0, cfg.Count, func(ctx context.Context, index int, m *metrics.MetricSet) {
 				inst, err := g.At(index)
 				if err != nil {
-					m.Observe("generate", 0, err)
+					localObserve(ctx, m, "generate", err)
 					return
 				}
 				log.add(storeInstance(ctx, clients.GRPC, inst, updateCountFor(index), m))
 			})
-			if err := writeSendLog(cfg.OutputPath, log); err != nil {
-				return err
-			}
 			hash, err := contentHash(g)
 			if err != nil {
 				return err
 			}
-			return emitReport(ctx, cfg, "store", "grpc", reportExtra{datasetHash: hash}, m.Snapshot())
+			return emitReport(ctx, cfg, "store", "grpc", reportExtra{datasetHash: hash, sendLog: log}, m.Snapshot())
 		},
 	}
 	bindCommon(cmd, cfg)
@@ -119,7 +119,8 @@ func newQueryCmd() *cobra.Command {
 		Use:   "query",
 		Short: "Benchmark read/list performance against the seed range",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx := cmd.Context()
+			ctx := cfg.runContext(cmd.Context())
+			defer cfg.runtime.close()
 			clients, err := NewAPIClients(cfg.clientConfig())
 			if err != nil {
 				return err
@@ -129,14 +130,25 @@ func newQueryCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			g, err := newGenerator(cfg, false)
+			seedConfig := *cfg
+			if cfg.datasetCountSet {
+				seedConfig.Count = cfg.DatasetCount
+			}
+			g, err := newGenerator(&seedConfig, false)
 			if err != nil {
 				return err
+			}
+			if cfg.runtime != nil {
+				cfg.runtime.transport = transport
 			}
 			namespaces := g.Config().Namespaces
 			queries := defaultQueries()
 
 			read := func(ctx context.Context, workerID, iter int, m *metrics.MetricSet) {
+				if cfg.runtime != nil && cfg.runtime.cases != nil {
+					cfg.runtime.executeCase(ctx, iter, transport, clients, pageSize, m)
+					return
+				}
 				q := queries[iter%len(queries)]
 				ns := namespaces[(workerID+iter)%len(namespaces)]
 				runQuery(ctx, pick(iter), q, ns, pageSize, m)
@@ -173,10 +185,11 @@ func newMixedCmd() *cobra.Command {
 		Use:   "mixed",
 		Short: "Benchmark parallel store (live range) and query (seed range)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			defer cfg.runtime.close()
 			if cfg.Concurrency <= 1 {
 				return fmt.Errorf("concurrency for mixed mode must be greater than 1")
 			}
-			ctx := cmd.Context()
+			ctx := cfg.runContext(cmd.Context())
 			clients, err := NewAPIClients(cfg.clientConfig())
 			if err != nil {
 				return err
@@ -224,7 +237,8 @@ func newLoadCmd() *cobra.Command {
 		Use:   "load",
 		Short: "Load the seed dataset through the API and optionally verify row counts",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx := cmd.Context()
+			ctx := cfg.runContext(cmd.Context())
+			defer cfg.runtime.close()
 			clients, err := NewAPIClients(cfg.clientConfig())
 			if err != nil {
 				return err
@@ -235,17 +249,21 @@ func newLoadCmd() *cobra.Command {
 				return err
 			}
 			snap := m.Snapshot()
-			if err := writeSendLog(cfg.OutputPath, log); err != nil {
-				return err
-			}
 			if err := emitReport(ctx, cfg, "load", "grpc", reportExtra{
 				datasetHash: def.ContentHash,
 				seedLoad:    summarizeSeedLoad(log),
+				sendLog:     log,
 			}, snap); err != nil {
 				return err
 			}
 			if verify {
+				if cfg.pool != nil {
+					ctx = withPoolCredential(ctx, &cfg.pool.clients[0])
+				}
 				if err := verifySeed(ctx, grpcLister{c: clients.GRPC}, def); err != nil {
+					if cfg.pool != nil {
+						return fmt.Errorf("seed verification failed: %s", metrics.Classify(err))
+					}
 					return fmt.Errorf("seed verification failed: %w", err)
 				}
 				fmt.Fprintf(os.Stderr, "seed verified: %d PipelineRuns, dataset hash %s\n", def.Count, def.ContentHash)
@@ -287,6 +305,7 @@ type reportExtra struct {
 	readRatio   int
 	writeRatio  int
 	seedLoad    *report.SeedLoadMetrics
+	sendLog     *sendLog
 }
 
 // emitReport writes the same completed JSON report to its file and stdout.
@@ -312,9 +331,46 @@ func emitReport(ctx context.Context, cfg *RunConfig, mode, transport string, ext
 	}
 	rep := report.New(meta, rc, snap)
 	rep.Metrics.SeedLoad = extra.seedLoad
-	return withOutput(cfg.OutputPath, func(w *os.File) error {
-		return report.Write(io.MultiWriter(w, os.Stdout), rep)
-	})
+	if cfg.runtime != nil {
+		rep.Meta.RunID = uuid.NewString()
+		if cfg.pool != nil {
+			summary := cfg.pool.summary
+			rep.Config.ClientPool = &summary
+		}
+		rep.Metrics.Clients = cfg.runtime.clientSnapshots()
+		rep.Validation = cfg.runtime.validation(snap)
+		rep.Scenario = cfg.runtime.scenario
+		if cfg.datasetCountSet {
+			count := cfg.DatasetCount
+			rep.Config.DatasetCount = &count
+		}
+		if cfg.runtime.collector != nil {
+			rep.Config.MetricsCapture = cfg.runtime.collector.configuration()
+			rep.Metrics.Capture, rep.Validation.MetricsCapture = cfg.runtime.collector.results()
+		}
+	}
+	var serialized bytes.Buffer
+	if err := report.Write(&serialized, rep); err != nil {
+		return err
+	}
+	fileErr := withOutput(cfg.OutputPath, func(w *os.File) error { _, err := w.Write(serialized.Bytes()); return err })
+	_, stdoutErr := os.Stdout.Write(serialized.Bytes())
+	var sendErr error
+	if extra.sendLog != nil {
+		sendErr = writeSendLog(cfg.OutputPath, extra.sendLog)
+	}
+	if err := errors.Join(fileErr, stdoutErr, sendErr); err != nil {
+		return err
+	}
+	if rep.Validation != nil {
+		if rep.Validation.Execution.Status == "interrupted" {
+			return fmt.Errorf("benchmark interrupted")
+		}
+		if cfg.runtime.cases != nil && rep.Validation.Responses.Status != "passed" {
+			return fmt.Errorf("access case validation %s", rep.Validation.Responses.Status)
+		}
+	}
+	return nil
 }
 
 // listerPicker returns a function selecting the transport for a given iteration.

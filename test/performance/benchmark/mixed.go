@@ -42,6 +42,7 @@ type mixedParams struct {
 // never contend on the same Result. Writers pull distinct live indices via an
 // atomic counter (each index, and thus each Result, handled once).
 func runMixed(ctx context.Context, gc pb.ResultsClient, live, seed *generator.Generator, p mixedParams) *metrics.MetricSet {
+	stateFrom(ctx).beforeMeasurement(ctx)
 	writers, readers := splitWorkers(p.Concurrency, p.ReadRatio, p.WriteRatio)
 
 	runCtx := ctx
@@ -81,12 +82,15 @@ func runMixed(ctx context.Context, gc pb.ResultsClient, live, seed *generator.Ge
 				if i >= liveCount {
 					return
 				}
+				opCtx := stateFrom(ctx).begin(runCtx, i)
 				inst, err := live.At(i)
 				if err != nil {
-					ws.Observe("generate", 0, err)
+					localObserve(opCtx, ws, "generate", err)
+					endLogical(opCtx)
 					continue
 				}
-				storeInstance(runCtx, gc, inst, updateCountFor(i), ws)
+				storeInstance(opCtx, gc, inst, updateCountFor(i), ws)
+				endLogical(opCtx)
 			}
 		}()
 	}
@@ -95,6 +99,7 @@ func runMixed(ctx context.Context, gc pb.ResultsClient, live, seed *generator.Ge
 	queries := defaultQueries()
 	namespaces := seed.Config().Namespaces
 	l := grpcLister{c: gc}
+	var readDispatch atomic.Int64
 	for r := 0; r < readers; r++ {
 		readerWG.Add(1)
 		go func(readerID int) {
@@ -102,9 +107,15 @@ func runMixed(ctx context.Context, gc pb.ResultsClient, live, seed *generator.Ge
 			rs := metrics.NewMetricSet()
 			addSet(rs)
 			for iter := 0; readerCtx.Err() == nil; iter++ {
-				q := queries[iter%len(queries)]
+				index := iter
+				if stateFrom(ctx).sharedDispatch() {
+					index = int(readDispatch.Add(1) - 1)
+				}
+				opCtx := stateFrom(ctx).begin(readerCtx, index)
+				q := queries[index%len(queries)]
 				ns := namespaces[(readerID+iter)%len(namespaces)]
-				runQuery(readerCtx, l, q, ns, p.PageSize, rs)
+				runQuery(opCtx, l, q, ns, p.PageSize, rs)
+				endLogical(opCtx)
 			}
 		}(r)
 	}
@@ -116,10 +127,16 @@ func runMixed(ctx context.Context, gc pb.ResultsClient, live, seed *generator.Ge
 	}
 
 	readerWG.Wait()
+	reason := "count-limit-reached"
+	if p.Duration > 0 {
+		reason = "duration-limit-reached"
+	}
+	stateFrom(ctx).finish(ctx, reason)
 	total.Stop()
 	for _, s := range sets {
 		total.Merge(s)
 	}
+	stateFrom(ctx).afterMeasurement(ctx)
 	return total
 }
 

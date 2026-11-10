@@ -45,7 +45,7 @@ func loadSeed(ctx context.Context, gc pb.ResultsClient, cfg *RunConfig) (*metric
 	m := runIndexed(ctx, cfg.Concurrency, 0, cfg.Count, func(ctx context.Context, index int, m *metrics.MetricSet) {
 		inst, err := g.At(index)
 		if err != nil {
-			m.Observe("generate", 0, err)
+			localObserve(ctx, m, "generate", err)
 			return
 		}
 		// One update finalizes the pending record to its terminal state.

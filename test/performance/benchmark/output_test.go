@@ -20,9 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tektoncd/results/test/performance/generator"
@@ -211,6 +215,92 @@ func TestWithOutputEmptyPathUsesTemporaryFile(t *testing.T) {
 			}
 			if want := "{}\n"; string(got) != want {
 				t.Errorf("report contents = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestReportFileFailureStillEmitsStdout(t *testing.T) {
+	cfg := testRunConfig()
+	cfg.OutputPath = t.TempDir()
+	data, err := captureStdout(t, func() error {
+		return emitReport(context.Background(), cfg, "query", "grpc", reportExtra{}, metrics.Snapshot{})
+	})
+	if err == nil || !json.Valid(data) {
+		t.Fatal("file failure discarded the stdout report")
+	}
+}
+
+func TestSendLogFailurePreservesReportOutputs(t *testing.T) {
+	cfg := testRunConfig()
+	cfg.OutputPath = filepath.Join(t.TempDir(), "report.json")
+	if err := os.Mkdir(filepath.Join(filepath.Dir(cfg.OutputPath), "report.sendlog.json"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := captureStdout(t, func() error {
+		return emitReport(context.Background(), cfg, "load", "grpc", reportExtra{sendLog: &sendLog{}}, metrics.Snapshot{})
+	})
+	if err == nil || !json.Valid(stdout) {
+		t.Fatal("send-log failure discarded stdout")
+	}
+	saved, err := os.ReadFile(cfg.OutputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(saved) != string(stdout) {
+		t.Fatal("send-log failure changed report bytes")
+	}
+}
+
+func TestPartialCaptureSurvivesOutputFailuresAndSkipsVerification(t *testing.T) {
+	for _, failure := range []string{"report", "stdout", "sendlog"} {
+		t.Run(failure, func(t *testing.T) {
+			var verification atomic.Int64
+			args := apiFixture(t, writableFixture{}, func(r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/ListRecords") {
+					verification.Add(1)
+				}
+			})
+			var attempts atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if attempts.Add(1) == 1 {
+					w.WriteHeader(500)
+					return
+				}
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte(metricText))
+			}))
+			defer srv.Close()
+			out := filepath.Join(t.TempDir(), "report.json")
+			if failure == "report" {
+				out = t.TempDir()
+			}
+			if failure == "sendlog" {
+				if err := os.Mkdir(strings.TrimSuffix(out, ".json")+".sendlog.json", 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := newRootCmd()
+			cmd.SetArgs(append(append([]string{"load"}, args...), "--token-pool", poolFixture(t, 2), "--metrics-config", metricsFixture(t, srv.URL), "--count", "2", "--namespaces", "1", "--verify", "--output", out))
+			stdout, err := captureStdout(t, func() error {
+				if failure == "stdout" {
+					_ = os.Stdout.Close()
+				}
+				return cmd.ExecuteContext(context.Background())
+			})
+			if err == nil || verification.Load() != 0 {
+				t.Fatal("output failure did not skip verification")
+			}
+			surviving := stdout
+			if failure == "stdout" {
+				surviving, _ = os.ReadFile(out)
+			}
+			var r report.Report
+			if err := json.Unmarshal(surviving, &r); err != nil {
+				t.Fatal(err)
+			}
+			if r.Validation.MetricsCapture.Status != "partial" || r.Metrics.Capture.Sources[0].After.Status != "available" || r.Validation.Execution.Status != "completed" {
+				t.Fatal("output failure changed execution or lost capture")
 			}
 		})
 	}

@@ -103,7 +103,7 @@ func storeInstance(ctx context.Context, gc pb.ResultsClient, inst *generator.Ins
 	record := func(err error) { entry.Codes = append(entry.Codes, metrics.Classify(err)) }
 
 	// 1. Ensure the parent Result exists (tolerate reruns via AlreadyExists).
-	err := observe(m, opCreateResult, func() error {
+	err := observe(ctx, m, opCreateResult, func() error {
 		_, e := gc.CreateResult(ctx, &pb.CreateResultRequest{
 			Parent: inst.Namespace,
 			Result: &pb.Result{
@@ -127,7 +127,7 @@ func storeInstance(ctx context.Context, gc pb.ResultsClient, inst *generator.Ins
 		return entry
 	}
 	var current *pb.Record
-	err = observe(m, opCreateRecord, func() error {
+	err = observe(ctx, m, opCreateRecord, func() error {
 		rec, e := gc.CreateRecord(ctx, &pb.CreateRecordRequest{
 			Parent: inst.ResultName,
 			Record: &pb.Record{Name: inst.RecordName, Data: pending},
@@ -149,7 +149,7 @@ func storeInstance(ctx context.Context, gc pb.ResultsClient, inst *generator.Ins
 			continue
 		}
 		current.Data = data
-		err = observe(m, opUpdateRecord, func() error {
+		err = observe(ctx, m, opUpdateRecord, func() error {
 			updated, e := gc.UpdateRecord(ctx, &pb.UpdateRecordRequest{Record: current, Etag: current.GetEtag()})
 			if e == nil {
 				current = updated
@@ -160,7 +160,7 @@ func storeInstance(ctx context.Context, gc pb.ResultsClient, inst *generator.Ins
 	}
 
 	// 3. Update the Result summary to the terminal status.
-	err = observe(m, opUpdateResult, func() error {
+	err = observe(ctx, m, opUpdateResult, func() error {
 		_, e := gc.UpdateResult(ctx, &pb.UpdateResultRequest{
 			Name: inst.ResultName,
 			Result: &pb.Result{
@@ -180,7 +180,7 @@ func storeInstance(ctx context.Context, gc pb.ResultsClient, inst *generator.Ins
 			continue
 		}
 		name := childRecordName(inst.ResultName, tr)
-		err = observe(m, opCreateChild, func() error {
+		err = observe(ctx, m, opCreateChild, func() error {
 			_, e := gc.CreateRecord(ctx, &pb.CreateRecordRequest{
 				Parent: inst.ResultName,
 				Record: &pb.Record{Name: name, Data: data},

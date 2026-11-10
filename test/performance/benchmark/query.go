@@ -82,7 +82,7 @@ func runQuery(ctx context.Context, l lister, q query, namespace string, pageSize
 	token := ""
 
 	if q.Single {
-		_ = observe(m, q.Op, func() error {
+		_ = observe(ctx, m, q.Op, func() error {
 			_, err := listPage(ctx, l, q, parent, pageSize, "")
 			return err
 		})
@@ -91,7 +91,7 @@ func runQuery(ctx context.Context, l lister, q query, namespace string, pageSize
 
 	for page := 0; page < maxPages; page++ {
 		var next string
-		err := observe(m, q.Op, func() error {
+		err := observe(ctx, m, q.Op, func() error {
 			var e error
 			next, e = listPage(ctx, l, q, parent, pageSize, token)
 			return e

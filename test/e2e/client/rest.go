@@ -3,7 +3,6 @@ package client
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +36,13 @@ type RESTClient interface {
 	ListRecords(ctx context.Context, in *v1alpha2.ListRecordsRequest) (*v1alpha2.ListRecordsResponse, error)
 	DeleteRecord(ctx context.Context, in *v1alpha2.DeleteRecordRequest) (*emptypb.Empty, error)
 }
+
+// HTTPStatusError preserves the HTTP status without changing legacy error text.
+type HTTPStatusError struct {
+	StatusCode int
+}
+
+func (e *HTTPStatusError) Error() string { return http.StatusText(e.StatusCode) }
 
 type restClient struct {
 	httpClient *http.Client
@@ -152,13 +158,10 @@ func (c *restClient) send(ctx context.Context, method, path string, in, out prot
 		return err
 	}
 
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
-		return errors.New(http.StatusText(res.StatusCode))
+		return &HTTPStatusError{StatusCode: res.StatusCode}
 	}
-
-	defer func() {
-		_ = res.Body.Close()
-	}()
 	b, err = io.ReadAll(res.Body)
 	if err != nil {
 		return err

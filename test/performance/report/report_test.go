@@ -171,3 +171,54 @@ func TestReportSeedLoadMetrics(t *testing.T) {
 		})
 	}
 }
+
+func TestLegacyAndExtendedReportCompatibility(t *testing.T) {
+	legacy := New(Meta{}, Config{}, sampleSnapshot())
+	var buf bytes.Buffer
+	if err := Write(&buf, legacy); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["validation"]; ok {
+		t.Fatal("legacy validation must be omitted")
+	}
+	legacy.Validation = &Validation{Execution: Execution{Status: "completed", ReasonCodes: []string{"count-limit-reached"}}}
+	legacy.Config.ClientPool = &ClientPool{PopulationID: "fixture", ConfiguredClients: 1000}
+	buf.Reset()
+	if err := Write(&buf, legacy); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Read(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Validation.Execution.Status != "completed" || got.Config.ClientPool.ConfiguredClients != 1000 || got.Metrics.ByOp["create_record"].ExitCodes["Unavailable"] != 1 {
+		t.Fatal("additive report lost legacy data or extensions")
+	}
+}
+
+func TestMetricProjectionPreservesLegacyAndUnavailable(t *testing.T) {
+	rep := New(Meta{}, Config{}, sampleSnapshot())
+	rep.Config.MetricsCapture = &CaptureConfig{Sources: []MetricSource{{ID: "api", InstanceID: "pod", ScopeEvidenceRef: "public-scope.json", Selectors: []MetricSelector{{ID: "hits", Metric: "test_hits_total", Type: "counter", Labels: map[string]string{}, Signal: "authn_hits"}}}}}
+	rep.Metrics.Capture = &MetricCapture{Sources: []CapturedSource{{ID: "api", InstanceID: "pod", Before: &CaptureAttempt{Status: "available", Observations: []MetricObservation{{ID: "hits", Status: "unavailable"}}}}}}
+	rep.Validation = &Validation{MetricsCapture: &CaptureStatus{Status: "partial"}}
+	var buf bytes.Buffer
+	if err := Write(&buf, rep); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Read(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metrics.Capture.Sources[0].Before.Observations[0].Value != nil || got.Validation.MetricsCapture.Status != "partial" || got.Metrics.ByOp["create_record"].ExitCodes["Unavailable"] != 1 {
+		t.Fatal("lost metric availability or legacy fields")
+	}
+	for _, private := range []string{"bearer_token_file", "ca_file", "authorization", "\"url\""} {
+		if bytes.Contains(buf.Bytes(), []byte(private)) {
+			t.Fatal("private collector field in report")
+		}
+	}
+}

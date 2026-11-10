@@ -19,6 +19,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/http"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -48,6 +49,7 @@ type ClientConfig struct {
 	ServerName    string // TLS server name (cert CN/SAN)
 	CertFile      string // CA cert file; empty means skip verification
 	TokenFile     string // bearer token file (service-account token)
+	pool          *tokenPool
 }
 
 // NewAPIClients constructs the gRPC and REST clients from cfg. When CertFile is
@@ -70,11 +72,12 @@ func NewAPIClients(cfg ClientConfig) (*APIClients, error) {
 		return nil, fmt.Errorf("TLS verification failed: %w", errors.New("TLS certificate not found"))
 	}
 
+	var perRPC credentials.PerRPCCredentials = &client.CustomCredentials{TokenSource: transport.NewCachedFileTokenSource(cfg.TokenFile), ImpersonationConfig: &transport.ImpersonationConfig{}}
+	if cfg.pool != nil {
+		perRPC = poolRPCCredentials{}
+	}
 	callOptions := []grpc.CallOption{
-		grpc.PerRPCCredentials(&client.CustomCredentials{
-			TokenSource:         transport.NewCachedFileTokenSource(cfg.TokenFile),
-			ImpersonationConfig: &transport.ImpersonationConfig{},
-		}),
+		grpc.PerRPCCredentials(perRPC),
 		// Realistic records are 8–57 KB each, so a full list page far exceeds
 		// gRPC's 4 MB default receive cap. Match the API server's own client
 		// limit (cmd/api/main.go) so verify/query/mixed can page large results.
@@ -90,6 +93,10 @@ func NewAPIClients(cfg ClientConfig) (*APIClients, error) {
 	}
 
 	restConfig := &transport.Config{TLS: tlsConfig, BearerTokenFile: cfg.TokenFile}
+	if cfg.pool != nil {
+		restConfig.BearerTokenFile = ""
+		restConfig.WrapTransport = func(base http.RoundTripper) http.RoundTripper { return &poolTransport{base: base} }
+	}
 	rc, err := client.NewRESTClient(cfg.ServerAddress, client.WithConfig(restConfig))
 	if err != nil {
 		_ = gc.Close()

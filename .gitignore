@@ -23,3 +23,10 @@ coverage.txt
 /mixed.json
 *.sendlog.json
 test/performance/output/
+
+# Local benchmark credentials and test binaries
+*.exe
+*.test
+*.out
+/load.json
+test/performance/credentials/
