@@ -57,6 +57,7 @@ func TestEmitReportWritesFileAndStdout(t *testing.T) {
 				defaultDir := t.TempDir()
 				t.Setenv("TMPDIR", defaultDir)
 				cfg := testRunConfig()
+				cfg.tokenCount = 1000
 				if output == "explicit path" {
 					cfg.OutputPath = filepath.Join(t.TempDir(), "nested", "report with spaces.json")
 				}
@@ -95,6 +96,9 @@ func TestEmitReportWritesFileAndStdout(t *testing.T) {
 				var got report.Report
 				if err := json.Unmarshal(stdout, &got); err != nil {
 					t.Fatalf("stdout is not a single JSON report: %v", err)
+				}
+				if got.Config.TokenCount != 1000 {
+					t.Errorf("report token_count = %d, want 1000", got.Config.TokenCount)
 				}
 				if got.Meta.Mode != mode || got.Metrics.TotalOps != 3 || got.Metrics.TotalErrors != 1 {
 					t.Errorf("stdout report mode/ops/errors = %s/%d/%d, want %s/3/1", got.Meta.Mode, got.Metrics.TotalOps, got.Metrics.TotalErrors, mode)

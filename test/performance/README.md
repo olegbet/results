@@ -97,6 +97,113 @@ go run ./test/performance/benchmark mixed  \
 --output test/performance/output/mixed.json --duration 60
 ```
 
+## Benchmarking the authentication/authorization cache with 1,000 users
+
+Use an API image containing [PR #1529](https://github.com/tektoncd/results/pull/1529).
+Keep `AUTH_DISABLE=false`. The cache defaults to disabled; enable it with
+`AUTH_CACHE_ENABLED=true`. Its default positive TTL is 5 minutes and negative TTL
+is 1 minute (`AUTH_CACHE_POSITIVE_TTL` / `AUTH_CACHE_NEGATIVE_TTL`).
+
+The helper creates 1–1000 ServiceAccounts in `results-benchmark`, grants them
+`tekton-results-admin` through one ClusterRoleBinding, and writes a distinct token
+for each identity. It requires permission to create these resources and request
+tokens in the **current kubectl context**. Load the seed dataset first, as above.
+
+```bash
+TOKENS_DIR=$(./test/performance/environments/kind/04-create-users.sh 1000)
+
+go run ./test/performance/benchmark query \
+  --cert "${SSL_CERT_PATH}/tekton-results-cert.pem" \
+  --tokens-dir "$TOKENS_DIR" --concurrency 1000 --duration 60 \
+  --transport grpc --output test/performance/output/cache-off.json
+```
+
+`--tokens-dir` works with `load`, `store`, `query`, and `mixed`, including REST.
+Files ending in `.token` are read once in filename order; each API request takes
+the next token, wrapping around. Empty or duplicate tokens and pools larger than
+1000 are rejected. The transports share the pool and connections. This models
+1000 identities, rather than 1000 separate TCP connections; `--concurrency`
+independently controls the number of workers. With few requests, some identities
+may never be used. Reports include `config.token_count` (the configured pool size,
+not the number of users actually reached), alongside throughput, latency, and
+errors. No token values or token paths are included in reports.
+
+Tokens are requested for 24 hours by default (`TOKEN_DURATION` overrides this);
+the Kubernetes API server may grant a shorter lifetime. They are not automatically
+refreshed during a run. Rerun the helper with a fresh output directory before a
+new session. Keep the pool directory private; it defaults to mode 0700 with files
+created as 0600. An optional second argument selects an empty output directory.
+
+### Collecting the available metrics
+
+Forward the Results metrics port in another terminal (adjust the deployment
+namespace if needed):
+
+```bash
+kubectl -n tekton-pipelines port-forward service/tekton-results-api-service 9090:9090
+```
+
+Take snapshots around each benchmark:
+
+```bash
+./test/performance/environments/kind/05-collect-metrics.sh /tmp/cache-off/before
+# Run the query command above.
+./test/performance/environments/kind/05-collect-metrics.sh /tmp/cache-off/after
+```
+
+The collector saves all Results metrics as `results.prom` and Kubernetes API
+server metrics as `kubernetes.prom`. `RESULTS_METRICS_URL` overrides the local
+Results endpoint. Access to Kubernetes `/metrics` is required. In an HA cluster,
+use Prometheus to aggregate all API servers and Results replicas; a snapshot of
+one endpoint may represent only one replica.
+
+PR #1529 does not add dedicated cache hit/miss counters. Use the benchmark JSON
+for client performance and compare the before/after increase in these Kubernetes
+counters to measure review traffic (other workloads also contribute):
+
+```promql
+sum by (resource, code) (
+  increase(apiserver_request_total{
+    group=~"authentication.k8s.io|authorization.k8s.io",
+    resource=~"tokenreviews|subjectaccessreviews", verb="POST"
+  }[1m])
+)
+```
+
+The PromQL example requires Prometheus scraping the API server; otherwise inspect
+those same series in the saved snapshots. Results exposes `grpc_server_*` and Go
+process metrics; histogram series require `PROMETHEUS_HISTOGRAM=true`.
+
+For a comparison, use the same image, seed dataset, tokens, concurrency, and run
+duration. On a deployment containing PR #1529, set the cache flag and wait for the
+rollout before each run:
+
+```bash
+kubectl -n tekton-pipelines set env deployment/tekton-results-api AUTH_CACHE_ENABLED=false
+kubectl -n tekton-pipelines rollout status deployment/tekton-results-api
+# Collect before, run query with cache-off.json, collect after.
+kubectl -n tekton-pipelines set env deployment/tekton-results-api AUTH_CACHE_ENABLED=true
+kubectl -n tekton-pipelines rollout status deployment/tekton-results-api
+# Collect before, run the same query with cache-on.json, collect after.
+```
+
+A rollout clears the in-memory cache. The first pass includes cold misses;
+repeat while the cache is warm to compare steady-state behavior. The standard
+query mix spans `--namespaces` (default 50), so authorization caching covers
+identity/resource/namespace combinations rather than just one entry per user.
+The 1000-token pool fits the authentication cache's 10,000-entry limit; this is a
+reuse/TTL benchmark, not an authentication-cache eviction test. Ensure reports
+show successful requests before interpreting performance.
+
+After benchmarking, remove the helper's dedicated users and binding if no longer
+needed, and remove the local token directory:
+
+```bash
+kubectl delete clusterrolebinding results-benchmark
+kubectl delete namespace results-benchmark
+rm -r -- "$TOKENS_DIR"
+```
+
 ## Subcommands
 
 | Command   | What it measures                                                        |
@@ -138,6 +245,7 @@ Defaults come from the same environment variables the e2e suite uses.
 | `--server-name`   | `tekton-results-api-service…svc…`    | `API_SERVER_NAME` |
 | `--cert`          | —                                    | `SSL_CERT_PATH`   |
 | `--token`         | —                                    | `SA_TOKEN_PATH`   |
+| `--tokens-dir`    | — (1–1000 `.token` files; overrides `--token`) |             |
 | `--concurrency`   | `8`                                  |                   |
 | `--count`         | `1000` (count-bounded runs)          |                   |
 | `--duration`      | `0` (count-bounded)                 |                   |

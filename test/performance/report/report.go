@@ -58,6 +58,7 @@ type Meta struct {
 type Config struct {
 	Count       int    `json:"count"`
 	Concurrency int    `json:"concurrency"`
+	TokenCount  int    `json:"token_count"`
 	DurationSec int    `json:"duration_sec"`
 	Transport   string `json:"transport"`
 	ReadRatio   int    `json:"read_ratio"`

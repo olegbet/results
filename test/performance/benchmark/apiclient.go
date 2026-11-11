@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 
+	"golang.org/x/oauth2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"k8s.io/client-go/transport"
@@ -30,8 +31,9 @@ import (
 // APIClients bundles the transport clients the benchmark drives. The store driver
 // uses gRPC; the query driver can use either transport.
 type APIClients struct {
-	GRPC client.GRPCClient
-	REST client.RESTClient
+	GRPC       client.GRPCClient
+	REST       client.RESTClient
+	TokenCount int
 }
 
 // Close releases REST idle connections and shuts down the gRPC client.
@@ -48,6 +50,7 @@ type ClientConfig struct {
 	ServerName    string // TLS server name (cert CN/SAN)
 	CertFile      string // CA cert file; empty means skip verification
 	TokenFile     string // bearer token file (service-account token)
+	TokensDir     string // optional pool of .token files, taking precedence over TokenFile
 }
 
 // NewAPIClients constructs the gRPC and REST clients from cfg. When CertFile is
@@ -70,9 +73,19 @@ func NewAPIClients(cfg ClientConfig) (*APIClients, error) {
 		return nil, fmt.Errorf("TLS verification failed: %w", errors.New("TLS certificate not found"))
 	}
 
+	var tokenSource oauth2.TokenSource = transport.NewCachedFileTokenSource(cfg.TokenFile)
+	tokenCount := 1
+	if cfg.TokensDir != "" {
+		pool, err := loadTokenPool(cfg.TokensDir)
+		if err != nil {
+			return nil, err
+		}
+		tokenSource = pool
+		tokenCount = len(pool.tokens)
+	}
 	callOptions := []grpc.CallOption{
 		grpc.PerRPCCredentials(&client.CustomCredentials{
-			TokenSource:         transport.NewCachedFileTokenSource(cfg.TokenFile),
+			TokenSource:         tokenSource,
 			ImpersonationConfig: &transport.ImpersonationConfig{},
 		}),
 		// Realistic records are 8–57 KB each, so a full list page far exceeds
@@ -90,11 +103,15 @@ func NewAPIClients(cfg ClientConfig) (*APIClients, error) {
 	}
 
 	restConfig := &transport.Config{TLS: tlsConfig, BearerTokenFile: cfg.TokenFile}
+	if cfg.TokensDir != "" {
+		restConfig.BearerTokenFile = ""
+		restConfig.WrapTransport = transport.TokenSourceWrapTransport(tokenSource)
+	}
 	rc, err := client.NewRESTClient(cfg.ServerAddress, client.WithConfig(restConfig))
 	if err != nil {
 		_ = gc.Close()
 		return nil, fmt.Errorf("creating REST client: %w", err)
 	}
 
-	return &APIClients{GRPC: gc, REST: rc}, nil
+	return &APIClients{GRPC: gc, REST: rc, TokenCount: tokenCount}, nil
 }

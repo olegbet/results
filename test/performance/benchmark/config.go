@@ -31,6 +31,8 @@ type RunConfig struct {
 	ServerName    string
 	CertFile      string
 	TokenFile     string
+	TokensDir     string
+	tokenCount    int
 
 	// Workload shape.
 	Concurrency int
@@ -60,6 +62,7 @@ func bindCommon(cmd *cobra.Command, cfg *RunConfig) {
 	f.StringVar(&cfg.ServerName, "server-name", envOr("API_SERVER_NAME", "tekton-results-api-service.tekton-pipelines.svc.cluster.local"), "TLS server name (env API_SERVER_NAME)")
 	f.StringVar(&cfg.CertFile, "cert", os.Getenv("SSL_CERT_FILE"), "CA certificate file; empty skips verification (env SSL_CERT_FILE)")
 	f.StringVar(&cfg.TokenFile, "token", os.Getenv("SA_TOKEN_FILE"), "bearer token file (env SA_TOKEN_FILE)")
+	f.StringVar(&cfg.TokensDir, "tokens-dir", "", "directory of 1–1000 .token files; overrides --token and SA_TOKEN_FILE")
 
 	f.IntVar(&cfg.Concurrency, "concurrency", 8, "number of concurrent workers")
 	f.IntVar(&cfg.Count, "count", 1000, "number of top-level PipelineRuns (query: complete paginated queries) for count-bounded runs")
@@ -85,6 +88,7 @@ func (c *RunConfig) clientConfig() ClientConfig {
 		ServerName:    c.ServerName,
 		CertFile:      c.CertFile,
 		TokenFile:     c.TokenFile,
+		TokensDir:     c.TokensDir,
 	}
 }
 

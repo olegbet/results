@@ -82,6 +82,7 @@ func newStoreCmd() *cobra.Command {
 				return err
 			}
 			defer func() { _ = clients.Close() }()
+			cfg.tokenCount = clients.TokenCount
 			g, err := newGenerator(cfg, true) // store writes the live range
 			if err != nil {
 				return err
@@ -125,6 +126,7 @@ func newQueryCmd() *cobra.Command {
 				return err
 			}
 			defer func() { _ = clients.Close() }()
+			cfg.tokenCount = clients.TokenCount
 			pick, err := listerPicker(transport, clients)
 			if err != nil {
 				return err
@@ -182,6 +184,7 @@ func newMixedCmd() *cobra.Command {
 				return err
 			}
 			defer func() { _ = clients.Close() }()
+			cfg.tokenCount = clients.TokenCount
 			live, err := newGenerator(cfg, true)
 			if err != nil {
 				return err
@@ -230,6 +233,7 @@ func newLoadCmd() *cobra.Command {
 				return err
 			}
 			defer func() { _ = clients.Close() }()
+			cfg.tokenCount = clients.TokenCount
 			m, def, log, err := loadSeed(ctx, clients.GRPC, cfg)
 			if err != nil {
 				return err
@@ -303,6 +307,7 @@ func emitReport(ctx context.Context, cfg *RunConfig, mode, transport string, ext
 	rc := report.Config{
 		Count:       cfg.Count,
 		Concurrency: cfg.Concurrency,
+		TokenCount:  cfg.tokenCount,
 		DurationSec: cfg.DurationSec,
 		Transport:   transport,
 		ReadRatio:   extra.readRatio,
